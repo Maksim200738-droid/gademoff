@@ -400,7 +400,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Получаем данные пользователя из БД
     user_data = db.get_user(user.id)
-    balance = user_data.get('balance', 0) if user_data else 0
+    balance = 0  # Пока что баланс не реализован
     subscriptions = db.get_user_subscriptions(user.id)
     sub_count = len(subscriptions) if subscriptions else 0
     
@@ -432,7 +432,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_data = db.get_user(user.id)
-    balance = user_data.get('balance', 0) if user_data else 0
+    balance = 0  # Пока что баланс не реализован
     subscriptions = db.get_user_subscriptions(user.id)
     sub_count = len(subscriptions) if subscriptions else 0
     
@@ -1576,7 +1576,8 @@ def main():
         states={
             RENAME_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_rename_sub)]
         },
-        fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^my_subs$")]
+        fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^my_subs$")],
+        per_message=True
     )
     application.add_handler(rename_conv)
 
