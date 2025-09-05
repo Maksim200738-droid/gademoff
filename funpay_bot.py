@@ -4,11 +4,14 @@ import re
 import json
 import os
 import time
+import hashlib
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs
 
 
 # Лог-файл для попыток публикации
 LOG_PATH = "funpay_post_debug.log"
+POSTED_DB_PATH = "funpay_posted.json"
 
 
 def append_post_log(event: str, data: dict):
@@ -22,6 +25,45 @@ def append_post_log(event: str, data: dict):
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"Ошибка записи лога: {e}")
+
+
+def load_posted_db() -> dict:
+    """Загружает базу уже опубликованных источников/отпечатков для защиты от дублей."""
+    if os.path.exists(POSTED_DB_PATH):
+        try:
+            with open(POSTED_DB_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                data.setdefault("source_ids", [])
+                data.setdefault("fingerprints", [])
+                return data
+        except Exception:
+            return {"source_ids": [], "fingerprints": []}
+    return {"source_ids": [], "fingerprints": []}
+
+
+def save_posted_db(db: dict):
+    try:
+        with open(POSTED_DB_PATH, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Не удалось сохранить БД дублей: {e}")
+
+
+def _normalize_text(text: str) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+def compute_item_fingerprint(item: dict) -> str:
+    """Возвращает устойчивый отпечаток лота для анти-дубликатов."""
+    parts = [
+        _normalize_text(item.get("title", "")),
+        _normalize_text(item.get("short_description", "")),
+        _normalize_text(item.get("full_description", "")),
+        _normalize_text(item.get("seller", "")),
+        _normalize_text(item.get("link", "")),
+    ]
+    joined = "|".join(parts)
+    return hashlib.sha1(joined.encode("utf-8", errors="ignore")).hexdigest()
 
 
 # --- Telegram ---
@@ -330,9 +372,21 @@ def run_parse_and_post_via_state(state: dict) -> tuple[bool, str]:
     # Сохранить файл
     save_to_file(items_with_markup, filename='funpay_items.txt')
 
-    # Постинг
+    # Постинг с защитой от дублей
     posted = 0
+    skipped_duplicates = 0
+    posted_db = load_posted_db()
+    source_ids: set[str] = set(posted_db.get("source_ids", []))
+    fingerprints: set[str] = set(posted_db.get("fingerprints", []))
+
     for item in items_with_markup:
+        # Вычисляем ключи дублирования
+        source_offer_id = item.get('offer_id') or None
+        fp = compute_item_fingerprint(item)
+        if (source_offer_id and source_offer_id in source_ids) or fp in fingerprints:
+            skipped_duplicates += 1
+            append_post_log("duplicate_skipped", {"offer_id": source_offer_id, "fingerprint": fp, "title": item.get('title')})
+            continue
         src = {}
         if not item.get('short_description') or not item.get('full_description'):
             src = scrape_offer_page_details(session, item.get('link', '')) if item.get('link') else {}
@@ -355,8 +409,17 @@ def run_parse_and_post_via_state(state: dict) -> tuple[bool, str]:
         )
         if ok:
             posted += 1
+            # Запоминаем как опубликованное
+            if source_offer_id:
+                source_ids.add(str(source_offer_id))
+            fingerprints.add(fp)
 
-    return True, f"Готово. Найдено: {len(items)}; к публикации после фильтров: {len(items_with_markup)}; успешно опубликовано: {posted}."
+    # Сохраняем обновлённую БД дублей
+    posted_db["source_ids"] = sorted({str(x) for x in source_ids})
+    posted_db["fingerprints"] = sorted(fingerprints)
+    save_posted_db(posted_db)
+
+    return True, f"Готово. Найдено: {len(items)}; к публикации после фильтров: {len(items_with_markup)}; пропущено дублей: {skipped_duplicates}; успешно опубликовано: {posted}."
 
 
 # --- Авторизация через cookies ---
@@ -454,14 +517,18 @@ def parse_funpay_lot(lot_url: str):
             # Извлекаем числовое значение цены для сортировки
             price_value = extract_price_value(price)
 
-            # Краткое/подробное описание со страницы оффера
+            # Краткое/подробное описание со страницы оффера и идентификаторы
             short_description = ""
             full_description = ""
+            server = ""
+            offer_id = None
             if item_link:
                 try:
                     details = scrape_offer_page_details(session, item_link)
                     short_description = details.get("summary_ru") or ""
                     full_description = details.get("desc_ru") or ""
+                    server = details.get("server") or ""
+                    offer_id = details.get("offer_id")
                 except Exception:
                     pass
 
@@ -473,7 +540,9 @@ def parse_funpay_lot(lot_url: str):
                 "subscribers": subscribers,
                 "link": item_link,
                 "short_description": short_description,
-                "full_description": full_description
+                "full_description": full_description,
+                "server": server,
+                "offer_id": offer_id
             })
         except Exception as e:
             print(f"Ошибка при парсинге товара: {e}")
@@ -525,13 +594,14 @@ def scrape_offer_page_details(session: requests.Session, offer_url: str) -> dict
                         # Сохраняем переносы строк для <br/>
                         for br in val_div.find_all("br"):
                             br.replace_with("\n")
-                        return val_div.get_text(" ", strip=True)
+                        return val_div.get_text("\n", strip=True)
             return None
 
         subject = find_param_value("Тематика")
         subs_text = find_param_value("Количество подписчиков")
         short_desc = find_param_value("Краткое описание")
         full_desc = find_param_value("Подробное описание")
+        server_value = find_param_value("Сервер")
 
         if subject:
             details["subject"] = subject
@@ -546,6 +616,13 @@ def scrape_offer_page_details(session: requests.Session, offer_url: str) -> dict
             details["summary_ru"] = short_desc
         if full_desc:
             details["desc_ru"] = full_desc
+        if server_value:
+            details["server"] = server_value
+
+        # offer_id: пробуем получить из hidden input
+        offer_input = soup.find("input", {"name": "offer_id"})
+        if offer_input and offer_input.get("value"):
+            details["offer_id"] = offer_input.get("value").strip()
 
         append_post_log("offer_source_scraped", {"url": offer_url, "details": details})
     except Exception as e:
@@ -584,6 +661,10 @@ def save_to_file(items, filename='funpay_items.txt'):
             f.write(f"   Продавец: {item['seller']}\n")
             f.write(f"   Цена: {item['price']}\n")
             f.write(f"   Подписчики: {item['subscribers']:,}\n")
+            if item.get('offer_id'):
+                f.write(f"   Offer ID: {item['offer_id']}\n")
+            if item.get('server'):
+                f.write(f"   Сервер: {item['server']}\n")
             if item.get('short_description'):
                 f.write(f"   Кратко: {item['short_description']}\n")
             if item.get('full_description'):
