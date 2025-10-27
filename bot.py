@@ -25,27 +25,68 @@ db = Database()
 
 class VPNManager:
     def __init__(self):
-        self.api_url = os.getenv('REMNA_API_URL')
-        self.api_key = os.getenv('REMNA_API_KEY')
+        self.api_url = os.getenv('MARZBAN_API_URL')
+        self.api_username = os.getenv('MARZBAN_USERNAME')
+        self.api_password = os.getenv('MARZBAN_PASSWORD')
         self.session = requests.Session()
         self.session.verify = False
-        if self.api_key:
-            self.session.headers.update({'Authorization': f'Bearer {self.api_key}'})
+        self.access_token = None
         
         logger.info(f"VPNManager initialized with API URL: {self.api_url}")
+        
+        # Получаем токен при инициализации
+        self._authenticate()
+
+    def _authenticate(self):
+        """Аутентификация в Marzban API и получение access token"""
+        try:
+            if not self.api_username or not self.api_password:
+                logger.error("MARZBAN_USERNAME or MARZBAN_PASSWORD not provided")
+                return False
+                
+            auth_url = f"{self.api_url}/api/admin/token"
+            auth_data = {
+                "username": self.api_username,
+                "password": self.api_password
+            }
+            
+            logger.info(f"Authenticating with Marzban API at: {auth_url}")
+            response = self.session.post(auth_url, data=auth_data)
+            
+            if response.status_code == 200:
+                token_data = response.json()
+                self.access_token = token_data.get('access_token')
+                if self.access_token:
+                    self.session.headers.update({'Authorization': f'Bearer {self.access_token}'})
+                    logger.info("Successfully authenticated with Marzban API")
+                    return True
+                else:
+                    logger.error("No access token in response")
+                    return False
+            else:
+                logger.error(f"Authentication failed with status: {response.status_code}")
+                logger.error(f"Response: {response.text}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Authentication error: {e}")
+            return False
 
     def test_api_connection(self):
         """Test API connection and discover available endpoints"""
         try:
-            logger.info("Testing API connection...")
+            logger.info("Testing Marzban API connection...")
             
-            # Test basic connectivity
+            # Проверяем аутентификацию
+            if not self.access_token:
+                logger.error("No access token available")
+                return False
+            
+            # Тестируем основные endpoints
             test_endpoints = [
-                f"{self.api_url}/users",
-                f"{self.api_url}/status",
-                f"{self.api_url}/health",
-                f"{self.api_url}/",
-                f"{self.api_url}"
+                f"{self.api_url}/api/users",
+                f"{self.api_url}/api/system",
+                f"{self.api_url}/api/admin"
             ]
             
             for endpoint in test_endpoints:
@@ -53,14 +94,18 @@ class VPNManager:
                     logger.info(f"Testing endpoint: {endpoint}")
                     response = self.session.get(endpoint)
                     logger.info(f"Status: {response.status_code}")
-                    if response.status_code < 500:
-                        try:
-                            content = response.text[:500]  # First 500 chars
-                            logger.info(f"Response preview: {content}")
-                        except:
-                            logger.info("Could not read response content")
+                    
                     if response.status_code == 200:
+                        logger.info(f"Endpoint {endpoint} is working")
                         return True
+                    elif response.status_code == 401:
+                        # Токен истек, пробуем переаутентификацию
+                        logger.info("Token expired, re-authenticating...")
+                        if self._authenticate():
+                            response = self.session.get(endpoint)
+                            if response.status_code == 200:
+                                return True
+                                
                 except Exception as e:
                     logger.info(f"Endpoint {endpoint} failed: {e}")
                     continue
@@ -71,10 +116,18 @@ class VPNManager:
             return False
 
     def get_users(self):
+        """Получить список пользователей"""
         try:
-            response = self.session.get(f"{self.api_url}/users")
+            response = self.session.get(f"{self.api_url}/api/users")
             logger.info(f"Get users response status: {response.status_code}")
-            logger.info(f"Get users response body: {response.text[:500]}")
+            
+            if response.status_code == 401:
+                # Токен истек, переаутентификация
+                if self._authenticate():
+                    response = self.session.get(f"{self.api_url}/api/users")
+                else:
+                    raise Exception("Failed to re-authenticate")
+            
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -82,208 +135,151 @@ class VPNManager:
             raise
 
     def create_user(self, username, email=None, password=None, expireAt=None, **kwargs):
+        """Создать пользователя в Marzban"""
         try:
-            # RemnaWave API might expect different field names or format
-            # Let's try different common API formats
+            # Marzban API структура для создания пользователя
+            user_data = {
+                "username": username,
+                "proxies": kwargs.get('proxies', {
+                    "vless": {},
+                    "vmess": {},
+                    "trojan": {},
+                    "shadowsocks": {}
+                }),
+                "data_limit": kwargs.get('data_limit', 0),  # 0 = unlimited
+                "expire": None,
+                "status": kwargs.get('status', 'active')
+            }
             
-            # Try format 1: Standard format
-            data = {"username": username}
-            if email:
-                data["email"] = email
-            if password:
-                data["password"] = password
+            # Устанавливаем дату истечения если передана
             if expireAt:
-                # RemnaWave API expects expireAt as datetime string, not timestamp
-                # Convert timestamp to datetime and format as ISO 8601
                 if expireAt > 1000000000000:  # milliseconds
                     dt = datetime.fromtimestamp(expireAt / 1000)
                 else:  # seconds
                     dt = datetime.fromtimestamp(expireAt)
-                # Try ISO 8601 format with Z suffix (most common for APIs)
-                data["expireAt"] = dt.isoformat() + "Z"
-            data.update(kwargs)
+                # Marzban ожидает timestamp в секундах
+                user_data["expire"] = int(dt.timestamp())
             
-            logger.info(f"Creating VPN user with data: {data}")
-            logger.info(f"API URL: {self.api_url}/users")
-            logger.info(f"Headers: {dict(self.session.headers)}")
+            logger.info(f"Creating Marzban user with data: {user_data}")
             
-            response = self.session.post(f"{self.api_url}/users", json=data)
+            response = self.session.post(f"{self.api_url}/api/user", json=user_data)
+            
+            if response.status_code == 401:
+                # Токен истек, переаутентификация
+                if self._authenticate():
+                    response = self.session.post(f"{self.api_url}/api/user", json=user_data)
+                else:
+                    raise Exception("Failed to re-authenticate")
             
             logger.info(f"Response status code: {response.status_code}")
-            logger.info(f"Response headers: {dict(response.headers)}")
+            logger.info(f"Response body: {response.text}")
             
-            try:
-                response_text = response.text
-                logger.info(f"Response body: {response_text}")
-            except:
-                logger.info("Could not read response body")
-            
-            if response.status_code == 400:
-                # Try alternative formats for 400 errors
-                logger.info("Got 400 error, trying alternative API formats...")
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(f"Marzban user creation response: {result}")
                 
-                # Try format 2: Different field names
-                alt_data = {
-                    "name": username,
-                    "username": username,
-                }
-                if email:
-                    alt_data["email"] = email
-                if expireAt:
-                    # Try different datetime formats
-                    if expireAt > 1000000000000:  # milliseconds
-                        dt = datetime.fromtimestamp(expireAt / 1000)
-                    else:  # seconds
-                        dt = datetime.fromtimestamp(expireAt)
-                    # Try different datetime formats
-                    alt_data["expire_time"] = dt.isoformat()
-                    alt_data["expiry"] = dt.isoformat() + "+00:00"
-                    alt_data["expireAt"] = dt.strftime('%Y-%m-%d %H:%M:%S')
-                
-                logger.info(f"Trying alternative format: {alt_data}")
-                response = self.session.post(f"{self.api_url}/users", json=alt_data)
-                logger.info(f"Alternative response status: {response.status_code}")
-                
-                if response.status_code == 400:
-                    # Try format 3: Form data instead of JSON
-                    logger.info("Trying form data format...")
-                    form_data = {
-                        "username": username,
-                        "email": email or f"{username}@example.com",
-                    }
-                    if expireAt:
-                        if expireAt > 1000000000000:  # milliseconds
-                            dt = datetime.fromtimestamp(expireAt / 1000)
-                        else:  # seconds
-                            dt = datetime.fromtimestamp(expireAt)
-                        form_data["expireAt"] = dt.isoformat() + "Z"
-                    
-                    response = self.session.post(f"{self.api_url}/users", data=form_data)
-                    logger.info(f"Form data response status: {response.status_code}")
-            
-            response.raise_for_status()
-            
-            result = response.json()
-            logger.info(f"VPN user creation response: {result}")
-            
-            # Handle different response formats
-            user_id = None
-            if isinstance(result, dict):
-                # RemnaWave API returns data in 'response' field
-                if 'response' in result:
-                    response_data = result['response']
-                    user_id = (response_data.get('uuid') or 
-                             response_data.get('id') or 
-                             response_data.get('user_id') or 
-                             response_data.get('client_id'))
-                    
-                    # Use the response data as the main result
-                    result = response_data
+                # Marzban возвращает данные пользователя напрямую
+                if 'username' in result:
+                    # Добавляем id для совместимости с существующим кодом
+                    result['id'] = result.get('username')
+                    return result
                 else:
-                    # Fallback for other API formats
-                    user_id = result.get('id') or result.get('user_id') or result.get('client_id')
-                    if not user_id and 'data' in result:
-                        user_id = result['data'].get('id') or result['data'].get('user_id')
-            
-            if not user_id:
-                logger.error(f"Invalid response from VPN API: {result}")
-                raise Exception("Не удалось получить client_id от RemnaWave")
-            
-            # Ensure the result has the expected format
-            if 'id' not in result:
-                result['id'] = user_id
-            
-            return result
+                    logger.error(f"Invalid response from Marzban API: {result}")
+                    raise Exception("Не удалось получить данные пользователя от Marzban")
+            else:
+                error_text = response.text
+                logger.error(f"Error creating user. Status: {response.status_code}, Response: {error_text}")
+                raise Exception(f"Ошибка создания пользователя в Marzban: {error_text}")
+                
         except requests.exceptions.RequestException as e:
-            logger.error(f"Request error creating VPN user: {e}")
-            # Log more details about the error
-            if hasattr(e, 'response') and e.response is not None:
-                logger.error(f"Error response status: {e.response.status_code}")
-                try:
-                    logger.error(f"Error response body: {e.response.text}")
-                except:
-                    logger.error("Could not read error response body")
-            raise Exception(f"Ошибка подключения к VPN API: {str(e)}")
+            logger.error(f"Request error creating Marzban user: {e}")
+            raise Exception(f"Ошибка подключения к Marzban API: {str(e)}")
         except Exception as e:
-            logger.error(f"Error creating VPN user: {e}")
+            logger.error(f"Error creating Marzban user: {e}")
             raise
 
     def delete_user(self, user_id):
+        """Удалить пользователя"""
         try:
-            response = self.session.delete(f"{self.api_url}/users/{user_id}")
+            response = self.session.delete(f"{self.api_url}/api/user/{user_id}")
+            
+            if response.status_code == 401:
+                # Токен истек, переаутентификация
+                if self._authenticate():
+                    response = self.session.delete(f"{self.api_url}/api/user/{user_id}")
+                else:
+                    raise Exception("Failed to re-authenticate")
+            
             response.raise_for_status()
-            return response.json()
+            return response.json() if response.content else {"success": True}
         except Exception as e:
             logger.error(f"Error deleting user {user_id}: {e}")
             raise
 
     def get_user_config(self, user_id):
+        """Получить конфигурацию пользователя"""
         try:
-            # Try different possible endpoints for getting user config
+            # Marzban endpoints для получения конфигурации
             endpoints = [
-                f"{self.api_url}/users/{user_id}/config",
-                f"{self.api_url}/users/{user_id}/subscription",
-                f"{self.api_url}/users/{user_id}",
-                f"{self.api_url}/user/{user_id}/config",
-                f"{self.api_url}/client/{user_id}/config"
+                f"{self.api_url}/api/user/{user_id}",
+                f"{self.api_url}/sub/{user_id}",
+                f"{self.api_url}/sub/{user_id}/"
             ]
             
             for endpoint in endpoints:
                 try:
                     logger.info(f"Trying config endpoint: {endpoint}")
                     response = self.session.get(endpoint)
+                    
+                    if response.status_code == 401:
+                        # Токен истек, переаутентификация
+                        if self._authenticate():
+                            response = self.session.get(endpoint)
+                        else:
+                            continue
+                    
                     logger.info(f"Config response status: {response.status_code}")
                     
                     if response.status_code == 200:
-                        result = response.json()
-                        logger.info(f"VPN config response for user {user_id}: {result}")
-                        
-                        # Handle different response formats
-                        config = None
-                        if isinstance(result, dict):
-                            # RemnaWave API returns data in 'response' field
-                            if 'response' in result:
-                                response_data = result['response']
-                                config = (response_data.get('subscriptionUrl') or
-                                        response_data.get('subscription_url') or 
-                                        response_data.get('config') or 
-                                        response_data.get('link') or 
-                                        response_data.get('url'))
-                                result = response_data  # Use response data
-                            else:
-                                # Try different possible field names for the config
-                                config = (result.get('config') or 
-                                        result.get('subscription_url') or 
-                                        result.get('link') or 
-                                        result.get('url') or
-                                        result.get('vless') or
-                                        result.get('vmess'))
-                                
-                                # If config is in a nested data object
-                                if not config and 'data' in result:
-                                    data = result['data']
-                                    config = (data.get('config') or 
-                                            data.get('subscription_url') or 
-                                            data.get('link') or 
-                                            data.get('url'))
-                        
-                        # If we found a config, add it to the result in expected format
-                        if config:
-                            if 'link' not in result:
-                                result['link'] = config
-                            if 'config' not in result:
-                                result['config'] = config
-                            return result
+                        # Для subscription URL возвращаем текст напрямую
+                        if '/sub/' in endpoint:
+                            config_text = response.text
+                            if config_text and not config_text.startswith('<!DOCTYPE'):
+                                return {
+                                    'id': user_id,
+                                    'username': user_id,
+                                    'config': config_text,
+                                    'link': config_text,
+                                    'subscription_url': endpoint
+                                }
                         else:
-                            # If no config found but response was successful, return the result anyway
+                            # Для API endpoint возвращаем JSON
+                            result = response.json()
+                            logger.info(f"Marzban config response for user {user_id}: {result}")
+                            
+                            # Добавляем subscription URL
+                            if 'subscription_url' not in result:
+                                result['subscription_url'] = f"{self.api_url}/sub/{user_id}"
+                            
+                            # Добавляем config и link для совместимости
+                            if 'config' not in result and 'subscription_url' in result:
+                                result['config'] = result['subscription_url']
+                                result['link'] = result['subscription_url']
+                            
                             return result
                     
                 except requests.exceptions.RequestException as e:
                     logger.info(f"Endpoint {endpoint} failed: {e}")
                     continue
             
-            # If all endpoints failed
-            raise Exception(f"All config endpoints failed for user {user_id}")
+            # Если все endpoints не сработали, возвращаем базовую конфигурацию
+            return {
+                'id': user_id,
+                'username': user_id,
+                'subscription_url': f"{self.api_url}/sub/{user_id}",
+                'config': f"{self.api_url}/sub/{user_id}",
+                'link': f"{self.api_url}/sub/{user_id}"
+            }
             
         except Exception as e:
             logger.error(f"Error getting user config for {user_id}: {e}")
@@ -404,7 +400,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Получаем данные пользователя из БД
     user_data = db.get_user(user.id)
-    balance = user_data.get('balance', 0) if user_data else 0
+    balance = 0  # Пока что баланс не реализован
     subscriptions = db.get_user_subscriptions(user.id)
     sub_count = len(subscriptions) if subscriptions else 0
     
@@ -436,7 +432,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_data = db.get_user(user.id)
-    balance = user_data.get('balance', 0) if user_data else 0
+    balance = 0  # Пока что баланс не реализован
     subscriptions = db.get_user_subscriptions(user.id)
     sub_count = len(subscriptions) if subscriptions else 0
     
@@ -1580,7 +1576,8 @@ def main():
         states={
             RENAME_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_rename_sub)]
         },
-        fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^my_subs$")]
+        fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^my_subs$")],
+        per_message=True
     )
     application.add_handler(rename_conv)
 
