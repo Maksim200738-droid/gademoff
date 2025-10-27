@@ -1,0 +1,6 @@
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.2.2
+
+# Optional dependency if you use FunPayAPI.account (provide your own if different)
+# funpayapi==0.1.0
